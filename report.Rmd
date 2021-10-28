@@ -1,0 +1,121 @@
+---
+title: "report"
+author: "Daniel Negrón"
+date: "8/21/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(ggtree)
+```
+
+```{r}
+read_outfmt_7 <- function(path, col_types = cols(.default = "c")) {
+  lines <- read_lines(path)
+  fields_tag <- "^# Fields: "
+  fields <- (
+    lines[grep(fields_tag, lines)] %>%
+      head(1) %>%
+      str_sub(str_length(fields_tag)) %>%
+      str_split(", ", simplify = T) %>%
+      .[1, ]
+  )
+  read_tsv(lines, col_names = fields, col_types = col_types, comment = "#")
+}
+
+df.hits <- (
+  bind_rows(
+    read_outfmt_7("hit-4a.tsv", col_types = "ccdiiiiiiiddci"),
+    read_outfmt_7("hit-4p.tsv", col_types = "ccdiiiiiiiddci")
+  ) %>%
+    filter(
+      `alignment length` >= 25000,
+      `% identity` >= 95
+    ) %>%
+    arrange(desc(`% identity`)) %>%
+    select(-`query acc.ver`) %>%
+    distinct(`subject acc.ver`, .keep_all = T)
+)
+```
+
+```{r}
+cmd <- paste(
+  "blastdbcmd -db data/blast/10508 -entry_batch -",
+  "./redigest.py - BamHI DraI EcoRI EcoRV SmaI XhoI",
+  sep = " | "
+)
+df.digest.long <- (
+  system(cmd, intern = T, input = df.hits$`subject acc.ver`) %>%
+    read_tsv(col_names = c("id", "enzyme", "length"), col_types = "ffi")
+)
+df.digest.wide <- (
+  pivot_wider(df.digest.long, names_from = enzyme, values_from = length, values_fn = length) %>%
+    column_to_rownames("id")
+)
+```
+
+```{r}
+hc <- (
+  dist(df.digest.wide) %>%
+    hclust()
+)
+
+cmd <- paste(
+  "python -m ffbio.ffidx data/genbank/10508.db -batch batch.txt -fo gb",
+  "python -m ffbio.ffqual - collection_date",
+  sep = " | "
+)
+df.date <- (
+  system(cmd, intern = T, input = df.hits$`subject acc.ver`) %>%
+    read_tsv(col_types = "fc")
+)
+
+df.meta <- (
+  enframe(hc$labels, name = NULL, value = "id") %>%
+    left_join(df.date, by = "id") %>%
+    left_join(read_tsv("meta.tsv", col_types = "fcc"), by = "id") %>%
+    left_join(df.hits, by = c(id = "subject acc.ver")) %>%
+    mutate(
+      cluster = cutree(hc, 2),
+      genotype = if_else(str_detect(`subject title`, "[Hh]uman adenovirus 4a"), "4a", genotype),
+      genotype = if_else(str_detect(`subject title`, "[Hh]uman adenovirus 4p"), "4p", genotype),
+      subgenotype = if_else(is.na(subgenotype), genotype, subgenotype)
+    ) %>%
+    replace(is.na(.), "N/A") %>%
+    clipr::write_clip()
+)
+
+subgenotypes <- sort(unique(df.meta$subgenotype))
+colors <- setNames(RColorBrewer::brewer.pal(length(subgenotypes), "Paired"), subgenotypes)
+colors["N/A"] <- "#000000"
+```
+
+```{r fig.width=6.5}
+p.tree <- (
+  ape::as.phylo(hc) %>%
+    ggtree()
+)
+p.digest <- (
+  mutate(
+    df.digest.long, 
+    id = factor(id, rev(get_taxa_name(p.tree))),
+    length = length / 1000
+  ) %>%
+  ggplot() +
+    geom_point(aes(length, id), pch = "[", color = "purple") +
+    facet_wrap(~enzyme, nrow = 1) + #, scales = "free_x") +
+    scale_x_reverse() +
+    xlab("length [Kbp]") +
+    ylab(NULL) +
+    theme_minimal() +
+    theme(
+      text = element_text(family = "mono"),
+      axis.text.x = element_text(hjust = 1, vjust = 0.5, angle = 90),
+      axis.text.y = element_text(hjust = 0)
+    )
+)
+p <- aplot::insert_left(p.digest, p.tree, width = 0.25)
+ggsave(p, filename = "plot.png")
+```
+
